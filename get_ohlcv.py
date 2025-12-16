@@ -106,12 +106,13 @@ class CoinExDailyData:
         
         print(f"\n{'='*80}\n")
     
-    def analyze_trend(self, data: List[Dict]) -> Dict:
+    def analyze_trend(self, data: List[Dict], use_modified: bool = True) -> Dict:
         """
         Analyze trend using Mann-Kendall test
         
         Args:
             data: Parsed kline data with Close prices
+            use_modified: If True, use Hamed-Rao modified test (better for autocorrelated data)
             
         Returns:
             Dictionary with trend analysis results
@@ -123,7 +124,8 @@ class CoinExDailyData:
                 'p_value': None,
                 'tau': None,
                 'slope': None,
-                'z_score': None
+                'z_score': None,
+                'test_type': 'none'
             }
         
         if not data or len(data) < 3:
@@ -133,36 +135,173 @@ class CoinExDailyData:
                 'p_value': None,
                 'tau': None,
                 'slope': None,
-                'z_score': None
+                'z_score': None,
+                'test_type': 'none'
             }
         
         try:
             # Extract close prices
             close_prices = [float(d['Close']) for d in data]
             
-            # Run Mann-Kendall test
-            result = mk.original_test(close_prices)
+            # Run appropriate Mann-Kendall test
+            if use_modified:
+                # Hamed-Rao Modified Test - accounts for autocorrelation
+                # Better for financial time series
+                result = mk.hamed_rao_modification_test(close_prices)
+                test_type = 'Hamed-Rao Modified'
+            else:
+                # Original Mann-Kendall test
+                result = mk.original_test(close_prices)
+                test_type = 'Original'
+            
+            # Check what attributes are available
+            # Different versions may have different attribute names
+            tau = getattr(result, 'tau', getattr(result, 'Tau', None))
+            slope = getattr(result, 'slope', getattr(result, 'Sen_slope', None))
             
             return {
                 'trend': result.trend,           # 'increasing', 'decreasing', 'no trend'
                 'p_value': result.p,             # Statistical significance
-                'tau': result.tau,               # Kendall's tau (-1 to 1)
-                'slope': result.slope,           # Sen's slope (rate of change)
+                'tau': tau,                      # Kendall's tau (-1 to 1)
+                'slope': slope,                  # Sen's slope (rate of change)
                 'z_score': result.z,             # Z-score
                 'h': result.h,                   # True if trend is significant
-                'significance': 'significant' if result.h else 'not significant'
+                'significance': 'significant' if result.h else 'not significant',
+                'test_type': test_type
             }
         except Exception as e:
+            import traceback
             return {
-                'error': str(e),
+                'error': f"{str(e)} - {traceback.format_exc()[:200]}",
                 'trend': 'error',
                 'p_value': None,
                 'tau': None,
                 'slope': None,
-                'z_score': None
+                'z_score': None,
+                'test_type': 'error'
             }
     
-    def analyze_all_usdt_trends(self, days: int = 365, min_data_points: int = 30):
+    def analyze_all_usdt_trends(self, days: int = 365, min_data_points: int = 30, use_modified: bool = True):
+        """
+        Analyze trends for all USDT markets and rank by trend strength
+        
+        Args:
+            days: Number of days to analyze
+            min_data_points: Minimum data points required for analysis
+            use_modified: If True, use Hamed-Rao modified test (recommended for crypto)
+            
+        Returns:
+            List of markets sorted by trend strength
+        """
+        print(f"\n{'='*100}")
+        print(f"MANN-KENDALL TREND ANALYSIS - ALL USDT MARKETS")
+        print(f"Test Type: {'Hamed-Rao Modified (accounts for autocorrelation)' if use_modified else 'Original Mann-Kendall'}")
+        print(f"{'='*100}\n")
+        
+        if not HAS_MK:
+            print("❌ pymannkendall not installed")
+            print("   Install with: pip install pymannkendall")
+            return []
+        
+        # Get all markets
+        all_markets = self.get_all_markets()
+        if not all_markets:
+            return []
+        
+        # Filter for USDT markets
+        usdt_markets = [m for m in all_markets if m.endswith('USDT')]
+        
+        print(f"Found {len(usdt_markets)} USDT markets")
+        print(f"Analyzing {days} days of data")
+        print(f"Minimum data points required: {min_data_points}\n")
+        
+        proceed = input(f"Analyze {len(usdt_markets)} markets? (y/n): ").strip().lower()
+        if proceed != 'y':
+            return []
+        
+        results = []
+        fetch_failed = 0
+        parse_failed = 0
+        insufficient_data = 0
+        trend_error = 0
+        
+        for i, market in enumerate(usdt_markets, 1):
+            if i % 50 == 0 or i <= 5:
+                print(f"Progress: {i}/{len(usdt_markets)} markets analyzed... (Success: {len(results)})")
+            
+            try:
+                # Fetch data (silent mode to reduce output)
+                klines = self.get_daily_klines(market, limit=days, silent=True)
+                if not klines:
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: No klines returned")
+                    fetch_failed += 1
+                    continue
+                
+                # Parse data
+                parsed_data = self.parse_kline_data(klines)
+                if not parsed_data:
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: Parse failed")
+                    parse_failed += 1
+                    continue
+                
+                if len(parsed_data) < min_data_points:
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: Only {len(parsed_data)} data points (need {min_data_points})")
+                    insufficient_data += 1
+                    continue
+                
+                # Analyze trend with selected test type
+                trend_result = self.analyze_trend(parsed_data, use_modified=use_modified)
+                
+                if trend_result.get('trend') == 'error':
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: Trend analysis error - {trend_result.get('error')}")
+                    trend_error += 1
+                    continue
+                
+                # Calculate additional metrics
+                first_close = parsed_data[0]['Close']
+                last_close = parsed_data[-1]['Close']
+                total_change_pct = ((last_close - first_close) / first_close * 100)
+                
+                results.append({
+                    'market': market,
+                    'trend': trend_result['trend'],
+                    'p_value': trend_result['p_value'],
+                    'tau': trend_result['tau'],
+                    'slope': trend_result['slope'],
+                    'z_score': trend_result['z_score'],
+                    'significance': trend_result['significance'],
+                    'test_type': trend_result.get('test_type', 'unknown'),
+                    'data_points': len(parsed_data),
+                    'first_close': first_close,
+                    'last_close': last_close,
+                    'total_change_%': total_change_pct
+                })
+                
+                if i <= 5:
+                    print(f"  ✓ {market}: {len(parsed_data)} points, trend={trend_result['trend']}, tau={trend_result['tau']:.4f}")
+                
+                # Rate limiting
+                time.sleep(0.3)
+                
+            except Exception as e:
+                if i <= 5:
+                    print(f"  ❌ {market}: Exception - {e}")
+                trend_error += 1
+                continue
+        
+        print(f"\n✓ Analysis complete!")
+        print(f"   Successfully analyzed: {len(results)}")
+        print(f"   Fetch failed:          {fetch_failed}")
+        print(f"   Parse failed:          {parse_failed}")
+        print(f"   Insufficient data:     {insufficient_data}")
+        print(f"   Trend error:           {trend_error}")
+        print()
+        
+        return results
         """
         Analyze trends for all USDT markets and rank by trend strength
         
@@ -191,59 +330,93 @@ class CoinExDailyData:
         usdt_markets = [m for m in all_markets if m.endswith('USDT')]
         
         print(f"Found {len(usdt_markets)} USDT markets")
-        print(f"Analyzing {days} days of data\n")
+        print(f"Analyzing {days} days of data")
+        print(f"Minimum data points required: {min_data_points}\n")
         
         proceed = input(f"Analyze {len(usdt_markets)} markets? (y/n): ").strip().lower()
         if proceed != 'y':
             return []
         
         results = []
+        fetch_failed = 0
+        parse_failed = 0
+        insufficient_data = 0
+        trend_error = 0
         
         for i, market in enumerate(usdt_markets, 1):
-            if i % 50 == 0:
-                print(f"Progress: {i}/{len(usdt_markets)} markets analyzed...")
+            if i % 50 == 0 or i <= 5:
+                print(f"Progress: {i}/{len(usdt_markets)} markets analyzed... (Success: {len(results)})")
             
             try:
-                # Fetch data
-                klines = self.get_daily_klines(market, limit=days)
+                # Fetch data (silent mode to reduce output)
+                klines = self.get_daily_klines(market, limit=days, silent=True)
                 if not klines:
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: No klines returned")
+                    fetch_failed += 1
                     continue
                 
                 # Parse data
                 parsed_data = self.parse_kline_data(klines)
-                if not parsed_data or len(parsed_data) < min_data_points:
+                if not parsed_data:
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: Parse failed")
+                    parse_failed += 1
+                    continue
+                
+                if len(parsed_data) < min_data_points:
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: Only {len(parsed_data)} data points (need {min_data_points})")
+                    insufficient_data += 1
                     continue
                 
                 # Analyze trend
                 trend_result = self.analyze_trend(parsed_data)
                 
-                if trend_result.get('trend') != 'error':
-                    # Calculate additional metrics
-                    first_close = parsed_data[0]['Close']
-                    last_close = parsed_data[-1]['Close']
-                    total_change_pct = ((last_close - first_close) / first_close * 100)
-                    
-                    results.append({
-                        'market': market,
-                        'trend': trend_result['trend'],
-                        'p_value': trend_result['p_value'],
-                        'tau': trend_result['tau'],
-                        'slope': trend_result['slope'],
-                        'z_score': trend_result['z_score'],
-                        'significance': trend_result['significance'],
-                        'data_points': len(parsed_data),
-                        'first_close': first_close,
-                        'last_close': last_close,
-                        'total_change_%': total_change_pct
-                    })
+                if trend_result.get('trend') == 'error':
+                    if i <= 5:
+                        print(f"  ⚠️  {market}: Trend analysis error - {trend_result.get('error')}")
+                    trend_error += 1
+                    continue
+                
+                # Calculate additional metrics
+                first_close = parsed_data[0]['Close']
+                last_close = parsed_data[-1]['Close']
+                total_change_pct = ((last_close - first_close) / first_close * 100)
+                
+                results.append({
+                    'market': market,
+                    'trend': trend_result['trend'],
+                    'p_value': trend_result['p_value'],
+                    'tau': trend_result['tau'],
+                    'slope': trend_result['slope'],
+                    'z_score': trend_result['z_score'],
+                    'significance': trend_result['significance'],
+                    'data_points': len(parsed_data),
+                    'first_close': first_close,
+                    'last_close': last_close,
+                    'total_change_%': total_change_pct
+                })
+                
+                if i <= 5:
+                    print(f"  ✓ {market}: {len(parsed_data)} points, trend={trend_result['trend']}, tau={trend_result['tau']:.4f}")
                 
                 # Rate limiting
                 time.sleep(0.3)
                 
             except Exception as e:
+                if i <= 5:
+                    print(f"  ❌ {market}: Exception - {e}")
+                trend_error += 1
                 continue
         
-        print(f"\n✓ Analysis complete: {len(results)} markets analyzed\n")
+        print(f"\n✓ Analysis complete!")
+        print(f"   Successfully analyzed: {len(results)}")
+        print(f"   Fetch failed:          {fetch_failed}")
+        print(f"   Parse failed:          {parse_failed}")
+        print(f"   Insufficient data:     {insufficient_data}")
+        print(f"   Trend error:           {trend_error}")
+        print()
         
         return results
     
@@ -314,7 +487,8 @@ class CoinExDailyData:
         try:
             with open(filename, 'w', newline='') as f:
                 fieldnames = ['market', 'trend', 'p_value', 'tau', 'slope', 'z_score', 
-                            'significance', 'data_points', 'first_close', 'last_close', 'total_change_%']
+                            'significance', 'test_type', 'data_points', 'first_close', 
+                            'last_close', 'total_change_%']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(results)
@@ -356,7 +530,62 @@ class CoinExDailyData:
         except Exception as e:
             print(f"❌ Error saving markets list: {e}")
         
-    def get_daily_klines(self, market: str, limit: int = 1000) -> List[Dict]:
+    def get_daily_klines(self, market: str, limit: int = 1000, silent: bool = False) -> List[Dict]:
+        """
+        Get daily candlestick data for a market
+        
+        Args:
+            market: Market symbol (e.g., 'BTCUSDT')
+            limit: Number of days to fetch (max 1000)
+            silent: If True, suppress output messages
+            
+        Returns:
+            List of daily candles with OHLCV data
+        """
+        try:
+            url = f"{self.base_url}/spot/kline"
+            params = {
+                "market": market,
+                "period": "1day",  # Daily candles
+                "limit": limit
+            }
+            
+            if not silent:
+                print(f"Fetching {limit} days of data for {market}...")
+            response = requests.get(url, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get("code") == 0:
+                    klines = data.get("data", [])
+                    if not silent:
+                        print(f"✓ Retrieved {len(klines)} daily candles")
+                    
+                    # Only show debug for first market when not silent
+                    if not silent and klines and len(klines) > 0:
+                        print(f"\n📊 Sample kline structure:")
+                        print(f"   Type: {type(klines[0])}")
+                        print(f"   Length: {len(klines[0]) if isinstance(klines[0], (list, tuple)) else 'N/A'}")
+                        print(f"   First kline: {klines[0]}")
+                        print()
+                    
+                    return klines
+                else:
+                    if not silent:
+                        print(f"❌ API Error: {data.get('message')}")
+                    return []
+            else:
+                if not silent:
+                    print(f"❌ HTTP Error: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            if not silent:
+                print(f"❌ Error fetching data: {e}")
+                import traceback
+                traceback.print_exc()
+            return []
         """
         Get daily candlestick data for a market
         
@@ -892,14 +1121,20 @@ def main():
         print("   This will analyze ALL USDT markets for trend strength")
         print("   Helps identify markets with strongest uptrends/downtrends\n")
         
-        days_input = input(f"Enter number of days to analyze (default: {DAYS}, max: 1000): ").strip()
+        print("Select test type:")
+        print("1. Hamed-Rao Modified (RECOMMENDED for crypto - handles autocorrelation)")
+        print("2. Original Mann-Kendall")
+        test_choice = input("Test type (1 or 2, default: 1): ").strip()
+        use_modified = test_choice != "2"
+        
+        days_input = input(f"\nEnter number of days to analyze (default: {DAYS}, max: 1000): ").strip()
         days = int(days_input) if days_input else DAYS
         
         top_n_input = input("How many top trends to display? (default: 20): ").strip()
         top_n = int(top_n_input) if top_n_input else 20
         
         # Run analysis
-        results = fetcher.analyze_all_usdt_trends(days)
+        results = fetcher.analyze_all_usdt_trends(days, use_modified=use_modified)
         
         if results:
             # Display results
