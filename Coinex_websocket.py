@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import time
+import gzip
 import websockets
 from typing import Optional, Dict, Callable
 
@@ -60,9 +61,13 @@ class CoinExWebSocket:
         return signature
     
     async def connect(self):
-        """Establish WebSocket connection"""
+        """Establish WebSocket connection with deflate compression"""
         print("Connecting to CoinEx WebSocket...")
-        self.websocket = await websockets.connect(self.ws_url)
+        # CoinEx v2 requires deflate compression
+        self.websocket = await websockets.connect(
+            self.ws_url,
+            compression='deflate'
+        )
         print("Connected successfully!")
         
     async def authenticate(self):
@@ -229,7 +234,29 @@ class CoinExWebSocket:
         try:
             while True:
                 message = await self.websocket.recv()
-                data = json.loads(message)
+                
+                # Handle compression - CoinEx sends gzip despite deflate connection
+                if isinstance(message, bytes):
+                    # Check if it's gzip compressed (starts with 0x1f 0x8b)
+                    if len(message) > 1 and message[0] == 0x1f and message[1] == 0x8b:
+                        try:
+                            message = gzip.decompress(message).decode('utf-8')
+                        except Exception as e:
+                            print(f"Error decompressing message: {e}")
+                            continue
+                    else:
+                        try:
+                            message = message.decode('utf-8')
+                        except Exception as e:
+                            print(f"Error decoding message: {e}")
+                            continue
+                
+                # Parse JSON
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing JSON: {e}")
+                    continue
                 
                 if callback:
                     callback(data)
@@ -246,40 +273,42 @@ class CoinExWebSocket:
         method = data.get("method", "")
         
         if method == "state.update":
-            # Ticker update
-            market = data.get("params", [{}])[0].get("market", "")
-            ticker = data.get("params", [{}])[0]
-            print(f"\n📊 Ticker Update [{market}]:")
-            print(f"   Last: {ticker.get('last')}")
-            print(f"   Volume: {ticker.get('volume')}")
-            print(f"   Change: {ticker.get('deal')}%")
+            # Ticker update - CoinEx v2 uses data.state_list
+            state_list = data.get("data", {}).get("state_list", [])
+            if state_list:
+                ticker = state_list[0]
+                market = ticker.get("market", "")
+                print(f"\n📊 Ticker Update [{market}]:")
+                print(f"   Last: {ticker.get('last')}")
+                print(f"   Volume: {ticker.get('volume')}")
+                print(f"   High: {ticker.get('high')}")
+                print(f"   Low: {ticker.get('low')}")
             
         elif method == "depth.update":
             # Order book update
-            params = data.get("params", [])
-            if params:
-                market = params[1]
-                depth = params[2]
-                print(f"\n📖 Order Book Update [{market}]:")
-                print(f"   Asks: {len(depth.get('asks', []))} levels")
-                print(f"   Bids: {len(depth.get('bids', []))} levels")
-                if depth.get('asks'):
-                    print(f"   Best Ask: {depth['asks'][0]}")
-                if depth.get('bids'):
-                    print(f"   Best Bid: {depth['bids'][0]}")
+            depth_data = data.get("data", {})
+            market = depth_data.get("market", "")
+            asks = depth_data.get("asks", [])
+            bids = depth_data.get("bids", [])
+            print(f"\n📖 Order Book Update [{market}]:")
+            print(f"   Asks: {len(asks)} levels")
+            print(f"   Bids: {len(bids)} levels")
+            if asks:
+                print(f"   Best Ask: {asks[0]}")
+            if bids:
+                print(f"   Best Bid: {bids[0]}")
                     
         elif method == "deals.update":
             # Trade update
-            params = data.get("params", [])
-            if len(params) >= 2:
-                market = params[0]
-                trades = params[1]
-                if trades:
-                    trade = trades[0]
-                    print(f"\n💰 Trade [{market}]:")
-                    print(f"   Price: {trade.get('price')}")
-                    print(f"   Amount: {trade.get('amount')}")
-                    print(f"   Type: {trade.get('type')}")
+            deals_data = data.get("data", {})
+            market = deals_data.get("market", "")
+            deals = deals_data.get("deals", [])
+            if deals:
+                trade = deals[0]
+                print(f"\n💰 Trade [{market}]:")
+                print(f"   Price: {trade.get('price')}")
+                print(f"   Amount: {trade.get('amount')}")
+                print(f"   Type: {trade.get('type')}")
                     
         elif method == "order.update":
             # User order update
