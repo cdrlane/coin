@@ -478,7 +478,646 @@ class CoinExDailyData:
         
         print(f"\n{'='*100}\n")
     
+    def analyze_trend_rolling_window(self, data: List[Dict], window_size: int = 30, 
+                                    use_modified: bool = True) -> List[Dict]:
+        """
+        Analyze trend using rolling window approach
+        
+        Args:
+            data: Parsed kline data with Close prices
+            window_size: Size of rolling window (default: 30 days)
+            use_modified: If True, use Hamed-Rao modified test
+            
+        Returns:
+            List of trend results for each window
+        """
+        if not HAS_MK:
+            return []
+        
+        if not data or len(data) < window_size:
+            return []
+        
+        rolling_results = []
+        
+        # Slide window through data
+        for i in range(len(data) - window_size + 1):
+            window_data = data[i:i + window_size]
+            
+            # Analyze this window
+            trend_result = self.analyze_trend(window_data, use_modified=use_modified)
+            
+            if trend_result.get('trend') != 'error':
+                # Add window metadata
+                result_with_meta = trend_result.copy()
+                result_with_meta['window_start'] = window_data[0]['Date']
+                result_with_meta['window_end'] = window_data[-1]['Date']
+                result_with_meta['window_size'] = window_size
+                result_with_meta['window_index'] = i
+                
+                rolling_results.append(result_with_meta)
+        
+        return rolling_results
+    
+    def analyze_rolling_window_all_markets(self, days: int = 90, window_size: int = 30, 
+                                          use_modified: bool = True):
+        """
+        Analyze ALL USDT markets using rolling window approach
+        
+        Args:
+            days: Total days of historical data to fetch
+            window_size: Size of rolling window (e.g., 30 days)
+            use_modified: If True, use Hamed-Rao modified test
+            
+        Returns:
+            Dictionary with market results
+        """
+        print(f"\n{'='*100}")
+        print(f"ROLLING WINDOW TREND ANALYSIS - ALL USDT MARKETS")
+        print(f"Analysis Period: Last {days} days")
+        print(f"Window Size: {window_size} days")
+        print(f"Test Type: {'Hamed-Rao Modified' if use_modified else 'Original Mann-Kendall'}")
+        print(f"{'='*100}\n")
+        
+        if not HAS_MK:
+            print("❌ pymannkendall not installed")
+            return {}
+        
+        if window_size >= days:
+            print(f"❌ Window size ({window_size}) must be smaller than total days ({days})")
+            return {}
+        
+        # Get all markets
+        all_markets = self.get_all_markets()
+        if not all_markets:
+            return {}
+        
+        # Filter for USDT markets
+        usdt_markets = [m for m in all_markets if m.endswith('USDT')]
+        
+        num_windows = days - window_size + 1
+        print(f"Found {len(usdt_markets)} USDT markets")
+        print(f"Each market will have {num_windows} rolling windows analyzed\n")
+        
+        proceed = input(f"Analyze {len(usdt_markets)} markets with rolling windows? (y/n): ").strip().lower()
+        if proceed != 'y':
+            return {}
+        
+        market_results = {}
+        successful = 0
+        failed = 0
+        
+        for i, market in enumerate(usdt_markets, 1):
+            if i % 50 == 0 or i <= 3:
+                print(f"Progress: {i}/{len(usdt_markets)} markets... (Success: {successful})")
+            
+            try:
+                # Fetch data
+                klines = self.get_daily_klines(market, limit=days, silent=True)
+                if not klines:
+                    failed += 1
+                    continue
+                
+                # Parse data
+                parsed_data = self.parse_kline_data(klines)
+                if not parsed_data or len(parsed_data) < days:
+                    failed += 1
+                    continue
+                
+                # Analyze with rolling window
+                rolling_results = self.analyze_trend_rolling_window(
+                    parsed_data, 
+                    window_size=window_size, 
+                    use_modified=use_modified
+                )
+                
+                if rolling_results:
+                    # Calculate aggregate metrics
+                    trends = [r['trend'] for r in rolling_results]
+                    taus = [r['tau'] for r in rolling_results if r['tau'] is not None]
+                    
+                    # Most recent window (most important)
+                    latest_window = rolling_results[-1]
+                    
+                    # Trend consistency
+                    increasing_count = trends.count('increasing')
+                    decreasing_count = trends.count('decreasing')
+                    no_trend_count = trends.count('no trend')
+                    
+                    # Average tau across all windows
+                    avg_tau = sum(taus) / len(taus) if taus else 0
+                    
+                    market_results[market] = {
+                        'market': market,
+                        'total_windows': len(rolling_results),
+                        'latest_trend': latest_window['trend'],
+                        'latest_tau': latest_window['tau'],
+                        'latest_p_value': latest_window['p_value'],
+                        'latest_slope': latest_window['slope'],
+                        'latest_significance': latest_window['significance'],
+                        'increasing_windows': increasing_count,
+                        'decreasing_windows': decreasing_count,
+                        'no_trend_windows': no_trend_count,
+                        'avg_tau': avg_tau,
+                        'trend_consistency': max(increasing_count, decreasing_count) / len(rolling_results) * 100,
+                        'all_windows': rolling_results
+                    }
+                    
+                    successful += 1
+                    
+                    if i <= 3:
+                        print(f"  ✓ {market}: {len(rolling_results)} windows, latest={latest_window['trend']}")
+                else:
+                    failed += 1
+                
+                # Rate limiting
+                time.sleep(0.3)
+                
+            except Exception as e:
+                if i <= 3:
+                    print(f"  ❌ {market}: {e}")
+                failed += 1
+                continue
+        
+        print(f"\n✓ Rolling window analysis complete!")
+        print(f"   Successfully analyzed: {successful}")
+        print(f"   Failed:                {failed}\n")
+        
+        return market_results
+    
+    def display_rolling_results(self, market_results: Dict, top_n: int = 20):
+        """Display rolling window analysis results"""
+        if not market_results:
+            print("No results to display")
+            return
+        
+        # Convert to list for sorting
+        results_list = list(market_results.values())
+        
+        print(f"\n{'='*100}")
+        print(f"ROLLING WINDOW ANALYSIS SUMMARY")
+        print(f"{'='*100}")
+        print(f"Total markets analyzed: {len(results_list)}")
+        
+        # Count latest trends
+        latest_increasing = sum(1 for r in results_list if r['latest_trend'] == 'increasing')
+        latest_decreasing = sum(1 for r in results_list if r['latest_trend'] == 'decreasing')
+        latest_no_trend = sum(1 for r in results_list if r['latest_trend'] == 'no trend')
+        
+        print(f"Latest window trends:")
+        print(f"  Increasing: {latest_increasing} ({latest_increasing/len(results_list)*100:.1f}%)")
+        print(f"  Decreasing: {latest_decreasing} ({latest_decreasing/len(results_list)*100:.1f}%)")
+        print(f"  No trend:   {latest_no_trend} ({latest_no_trend/len(results_list)*100:.1f}%)")
+        print(f"{'='*100}\n")
+        
+        # Top consistent uptrends
+        consistent_up = [r for r in results_list if r['latest_trend'] == 'increasing']
+        consistent_up.sort(key=lambda x: x['trend_consistency'], reverse=True)
+        
+        if consistent_up:
+            print(f"\n{'='*100}")
+            print(f"TOP {min(top_n, len(consistent_up))} MOST CONSISTENT UPTRENDS")
+            print(f"{'='*100}")
+            print(f"{'Market':<15} {'Latest Tau':<12} {'Avg Tau':<12} {'Consistency':<12} "
+                  f"{'Inc/Total':<15} {'Latest Sig.':<12}")
+            print("-"*100)
+            
+            for r in consistent_up[:top_n]:
+                print(f"{r['market']:<15} {r['latest_tau']:>11.4f} {r['avg_tau']:>11.4f} "
+                      f"{r['trend_consistency']:>10.1f}% "
+                      f"{r['increasing_windows']:>3}/{r['total_windows']:<9} "
+                      f"{r['latest_significance']:<12}")
+        
+        # Top consistent downtrends
+        consistent_down = [r for r in results_list if r['latest_trend'] == 'decreasing']
+        consistent_down.sort(key=lambda x: x['trend_consistency'], reverse=True)
+        
+        if consistent_down:
+            print(f"\n{'='*100}")
+            print(f"TOP {min(top_n, len(consistent_down))} MOST CONSISTENT DOWNTRENDS")
+            print(f"{'='*100}")
+            print(f"{'Market':<15} {'Latest Tau':<12} {'Avg Tau':<12} {'Consistency':<12} "
+                  f"{'Dec/Total':<15} {'Latest Sig.':<12}")
+            print("-"*100)
+            
+            for r in consistent_down[:top_n]:
+                print(f"{r['market']:<15} {r['latest_tau']:>11.4f} {r['avg_tau']:>11.4f} "
+                      f"{r['trend_consistency']:>10.1f}% "
+                      f"{r['decreasing_windows']:>3}/{r['total_windows']:<9} "
+                      f"{r['latest_significance']:<12}")
+        
+        print(f"\n{'='*100}\n")
+    
+    def save_rolling_results(self, market_results: Dict, filename: str = "rolling_trend_analysis.csv"):
+        """Save rolling window analysis results to CSV"""
+        if not market_results:
+            print("No results to save")
+            return
+        
+        try:
+            results_list = list(market_results.values())
+            
+            with open(filename, 'w', newline='') as f:
+                fieldnames = ['market', 'total_windows', 'latest_trend', 'latest_tau', 
+                            'latest_p_value', 'latest_slope', 'latest_significance',
+                            'increasing_windows', 'decreasing_windows', 'no_trend_windows',
+                            'avg_tau', 'trend_consistency']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for result in results_list:
+                    # Remove the nested 'all_windows' data for CSV
+                    csv_row = {k: v for k, v in result.items() if k != 'all_windows'}
+                    writer.writerow(csv_row)
+            
+            print(f"✓ Saved {len(results_list)} rolling analysis results to {filename}")
+        except Exception as e:
+            print(f"❌ Error saving results: {e}")
+    
+    def save_window_by_window_analysis(self, market_results: Dict, 
+                                      filename: str = "window_by_window_trends.csv",
+                                      top_n_per_window: int = 10):
+        """
+        Save detailed window-by-window analysis showing top trends for each window
+        
+        Args:
+            market_results: Results from analyze_rolling_window_all_markets
+            filename: Output CSV filename
+            top_n_per_window: Number of top up/down trends to save per window
+        """
+        if not market_results:
+            print("No results to save")
+            return
+        
+        try:
+            import os
+            
+            # Get the number of windows (should be same for all markets)
+            first_market = next(iter(market_results.values()))
+            num_windows = first_market['total_windows']
+            
+            print(f"\n{'='*80}")
+            print(f"Generating window-by-window analysis for {num_windows} windows...")
+            print(f"{'='*80}")
+            
+            # For each window, collect all market trends
+            window_data = []
+            
+            print(f"Collecting data for {num_windows} windows...")
+            
+            for window_idx in range(num_windows):
+                # Collect all markets' data for this specific window
+                window_markets = []
+                
+                for market, result in market_results.items():
+                    if window_idx < len(result['all_windows']):
+                        window_info = result['all_windows'][window_idx]
+                        window_markets.append({
+                            'market': market,
+                            'window_index': window_idx,
+                            'window_start': window_info['window_start'],
+                            'window_end': window_info['window_end'],
+                            'trend': window_info['trend'],
+                            'tau': window_info['tau'],
+                            'p_value': window_info['p_value'],
+                            'slope': window_info['slope'],
+                            'z_score': window_info['z_score'],
+                            'significance': window_info['significance']
+                        })
+                
+                # Sort by tau (strongest trends first)
+                window_markets.sort(key=lambda x: abs(x['tau']) if x['tau'] is not None else 0, reverse=True)
+                
+                # Get top uptrends
+                uptrends = [m for m in window_markets if m['trend'] == 'increasing'][:top_n_per_window]
+                
+                # Get top downtrends
+                downtrends = [m for m in window_markets if m['trend'] == 'decreasing'][:top_n_per_window]
+                downtrends.sort(key=lambda x: x['tau'] if x['tau'] is not None else 0)  # Most negative first
+                
+                # Store this window's data
+                window_data.append({
+                    'window_index': window_idx,
+                    'window_start': window_markets[0]['window_start'] if window_markets else '',
+                    'window_end': window_markets[0]['window_end'] if window_markets else '',
+                    'top_uptrends': uptrends,
+                    'top_downtrends': downtrends
+                })
+                
+                # Progress indicator
+                if (window_idx + 1) % 10 == 0:
+                    print(f"  Processed {window_idx + 1}/{num_windows} windows...")
+            
+            print(f"✓ Collected data for {len(window_data)} windows")
+            print(f"  Writing to CSV...")
+            
+            # Write to CSV
+            with open(filename, 'w', newline='') as f:
+                fieldnames = ['window_index', 'window_start', 'window_end', 'rank', 'direction',
+                            'market', 'trend', 'tau', 'p_value', 'slope', 'z_score', 'significance']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                rows_written = 0
+                
+                for window in window_data:
+                    # Debug: Show what we're processing
+                    if window['window_index'] < 3 or window['window_index'] >= num_windows - 1:
+                        print(f"  Window {window['window_index']}: {len(window['top_uptrends'])} uptrends, {len(window['top_downtrends'])} downtrends")
+                    
+                    # Write uptrends
+                    for rank, market_data in enumerate(window['top_uptrends'], 1):
+                        row = {
+                            'window_index': window['window_index'],
+                            'window_start': window['window_start'],
+                            'window_end': window['window_end'],
+                            'rank': rank,
+                            'direction': 'UP',
+                            'market': market_data['market'],
+                            'trend': market_data['trend'],
+                            'tau': market_data['tau'],
+                            'p_value': market_data['p_value'],
+                            'slope': market_data['slope'],
+                            'z_score': market_data['z_score'],
+                            'significance': market_data['significance']
+                        }
+                        writer.writerow(row)
+                        rows_written += 1
+                    
+                    # Write downtrends
+                    for rank, market_data in enumerate(window['top_downtrends'], 1):
+                        row = {
+                            'window_index': window['window_index'],
+                            'window_start': window['window_start'],
+                            'window_end': window['window_end'],
+                            'rank': rank,
+                            'direction': 'DOWN',
+                            'market': market_data['market'],
+                            'trend': market_data['trend'],
+                            'tau': market_data['tau'],
+                            'p_value': market_data['p_value'],
+                            'slope': market_data['slope'],
+                            'z_score': market_data['z_score'],
+                            'significance': market_data['significance']
+                        }
+                        writer.writerow(row)
+                        rows_written += 1
+            
+            # Get absolute path
+            abs_path = os.path.abspath(filename)
+            
+            print(f"\n{'='*80}")
+            print(f"✓ SUCCESSFULLY SAVED WINDOW-BY-WINDOW ANALYSIS")
+            print(f"{'='*80}")
+            print(f"Filename:          {filename}")
+            print(f"Full path:         {abs_path}")
+            print(f"Total windows:     {num_windows}")
+            print(f"Top per window:    {top_n_per_window} up + {top_n_per_window} down")
+            print(f"Total rows:        {rows_written}")
+            print(f"File size:         {os.path.getsize(filename):,} bytes")
+            print(f"{'='*80}\n")
+            
+        except Exception as e:
+            print(f"❌ Error saving window-by-window analysis: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def analyze_rolling_window_from_csv(self, csv_file: str, window_size: int = 30, 
+                                       use_modified: bool = True, min_data_points: int = 0):
+        """
+        Analyze rolling window trends from a pre-existing CSV file
+        
+        Args:
+            csv_file: Path to CSV file with market data (from option 5 or 2)
+            window_size: Size of rolling window
+            use_modified: If True, use Hamed-Rao modified test
+            min_data_points: Minimum data points required (0 = only check window_size)
+            
+        Returns:
+            Dictionary with market results
+        """
+        print(f"\n{'='*100}")
+        print(f"ROLLING WINDOW ANALYSIS FROM CSV FILE")
+        print(f"CSV File: {csv_file}")
+        print(f"Window Size: {window_size} days")
+        print(f"Test Type: {'Hamed-Rao Modified' if use_modified else 'Original Mann-Kendall'}")
+        print(f"{'='*100}\n")
+        
+        if not HAS_MK:
+            print("❌ pymannkendall not installed")
+            return {}
+        
+        import os
+        if not os.path.exists(csv_file):
+            print(f"❌ CSV file not found: {csv_file}")
+            return {}
+        
+        try:
+            # Load data from CSV
+            print(f"Loading data from {csv_file}...")
+            
+            with open(csv_file, 'r') as f:
+                reader = csv.DictReader(f)
+                all_rows = list(reader)
+            
+            print(f"✓ Loaded {len(all_rows)} rows from CSV")
+            
+            # Group by market
+            markets_data = {}
+            for row in all_rows:
+                market = row.get('Market', row.get('market', ''))
+                if not market:
+                    continue
+                
+                if market not in markets_data:
+                    markets_data[market] = []
+                
+                # Convert to format expected by analyze_trend
+                markets_data[market].append({
+                    'Date': row.get('Date', ''),
+                    'Timestamp': row.get('Timestamp', ''),
+                    'Close': float(row.get('Close', row.get('close', 0))),
+                    'Open': float(row.get('Open', row.get('open', 0))),
+                    'High': float(row.get('High', row.get('high', 0))),
+                    'Low': float(row.get('Low', row.get('low', 0))),
+                    'Volume': float(row.get('Volume', row.get('volume', 0)))
+                })
+            
+            # Filter for USDT markets
+            usdt_markets = {k: v for k, v in markets_data.items() if k.endswith('USDT')}
+            
+            print(f"✓ Found {len(usdt_markets)} USDT markets in CSV")
+            
+            # Show data summary
+            if usdt_markets:
+                data_lengths = [len(v) for v in usdt_markets.values()]
+                print(f"   Data points per market:")
+                print(f"      Min:     {min(data_lengths)} days")
+                print(f"      Max:     {max(data_lengths)} days")
+                print(f"      Average: {sum(data_lengths)/len(data_lengths):.1f} days")
+                print()
+            
+            # Check if we have enough data
+            if min_data_points > 0:
+                # Filter by minimum data points first
+                markets_with_enough_data = {k: v for k, v in usdt_markets.items() 
+                                           if len(v) >= min_data_points}
+                
+                if not markets_with_enough_data:
+                    print(f"❌ No markets have enough data (need at least {min_data_points} days)")
+                    return {}
+                
+                filtered_count = len(usdt_markets) - len(markets_with_enough_data)
+                if filtered_count > 0:
+                    print(f"   Filtered out {filtered_count} markets with < {min_data_points} data points")
+            else:
+                # Just check window size
+                markets_with_enough_data = {k: v for k, v in usdt_markets.items() 
+                                           if len(v) >= window_size}
+                
+                if not markets_with_enough_data:
+                    print(f"❌ No markets have enough data (need at least {window_size} days)")
+                    return {}
+            
+            print(f"✓ {len(markets_with_enough_data)} markets will be analyzed\n")
+            
+            # Determine analysis period
+            total_days = min(len(v) for v in markets_with_enough_data.values())
+            num_windows = total_days - window_size + 1
+            
+            print(f"📊 DATA ANALYSIS:")
+            print(f"   Markets with enough data: {len(markets_with_enough_data)}")
+            print(f"   Shortest market data:     {total_days} days")
+            print(f"   Window size:              {window_size} days")
+            print(f"   Calculated windows:       {num_windows}")
+            print()
+            
+            if num_windows < 1:
+                print(f"❌ Cannot create any windows!")
+                print(f"   Total days ({total_days}) must be >= window size ({window_size})")
+                return {}
+            
+            if num_windows < 5:
+                print(f"⚠️  WARNING: Only {num_windows} window(s) will be created")
+                print(f"   For meaningful rolling analysis, you need more data:")
+                print(f"   - Current: {total_days} days")
+                print(f"   - Recommended: {window_size * 3}+ days for {window_size}-day windows")
+                print()
+            
+            # Show data range for first few markets
+            print(f"📅 DATA RANGE SAMPLE:")
+            for i, (market, data) in enumerate(list(markets_with_enough_data.items())[:3]):
+                sorted_data = sorted(data, key=lambda x: x['Date'])
+                print(f"   {market}: {sorted_data[0]['Date']} to {sorted_data[-1]['Date']} ({len(data)} days)")
+            print()
+            
+            proceed = input(f"Analyze {len(markets_with_enough_data)} markets? (y/n): ").strip().lower()
+            if proceed != 'y':
+                return {}
+            
+            market_results = {}
+            successful = 0
+            failed = 0
+            
+            for i, (market, data) in enumerate(markets_with_enough_data.items(), 1):
+                if i % 50 == 0 or i <= 3:
+                    print(f"Progress: {i}/{len(markets_with_enough_data)} markets... (Success: {successful})")
+                
+                try:
+                    # Sort by date to ensure chronological order
+                    data_sorted = sorted(data, key=lambda x: x['Date'])
+                    
+                    # Use only the period we're analyzing
+                    data_to_analyze = data_sorted[-total_days:]
+                    
+                    # Analyze with rolling window
+                    rolling_results = self.analyze_trend_rolling_window(
+                        data_to_analyze,
+                        window_size=window_size,
+                        use_modified=use_modified
+                    )
+                    
+                    if rolling_results:
+                        # Calculate aggregate metrics
+                        trends = [r['trend'] for r in rolling_results]
+                        taus = [r['tau'] for r in rolling_results if r['tau'] is not None]
+                        
+                        # Most recent window
+                        latest_window = rolling_results[-1]
+                        
+                        # Trend consistency
+                        increasing_count = trends.count('increasing')
+                        decreasing_count = trends.count('decreasing')
+                        no_trend_count = trends.count('no trend')
+                        
+                        # Average tau
+                        avg_tau = sum(taus) / len(taus) if taus else 0
+                        
+                        market_results[market] = {
+                            'market': market,
+                            'total_windows': len(rolling_results),
+                            'latest_trend': latest_window['trend'],
+                            'latest_tau': latest_window['tau'],
+                            'latest_p_value': latest_window['p_value'],
+                            'latest_slope': latest_window['slope'],
+                            'latest_significance': latest_window['significance'],
+                            'increasing_windows': increasing_count,
+                            'decreasing_windows': decreasing_count,
+                            'no_trend_windows': no_trend_count,
+                            'avg_tau': avg_tau,
+                            'trend_consistency': max(increasing_count, decreasing_count) / len(rolling_results) * 100,
+                            'all_windows': rolling_results
+                        }
+                        
+                        successful += 1
+                        
+                        if i <= 3:
+                            print(f"  ✓ {market}: {len(rolling_results)} windows, latest={latest_window['trend']}")
+                    else:
+                        failed += 1
+                        
+                except Exception as e:
+                    if i <= 3:
+                        print(f"  ❌ {market}: {e}")
+                    failed += 1
+                    continue
+            
+            print(f"\n✓ Rolling window analysis complete!")
+            print(f"   Successfully analyzed: {successful}")
+            print(f"   Failed:                {failed}\n")
+            
+            return market_results
+            
+        except Exception as e:
+            print(f"❌ Error loading CSV: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+    
     def save_trend_results(self, results: List[Dict], filename: str = "trend_analysis_results.csv"):
+        """Save rolling window analysis results to CSV"""
+        if not market_results:
+            print("No results to save")
+            return
+        
+        try:
+            results_list = list(market_results.values())
+            
+            with open(filename, 'w', newline='') as f:
+                fieldnames = ['market', 'total_windows', 'latest_trend', 'latest_tau', 
+                            'latest_p_value', 'latest_slope', 'latest_significance',
+                            'increasing_windows', 'decreasing_windows', 'no_trend_windows',
+                            'avg_tau', 'trend_consistency']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for result in results_list:
+                    # Remove the nested 'all_windows' data for CSV
+                    csv_row = {k: v for k, v in result.items() if k != 'all_windows'}
+                    writer.writerow(csv_row)
+            
+            print(f"✓ Saved {len(results_list)} rolling analysis results to {filename}")
+        except Exception as e:
+            print(f"❌ Error saving results: {e}")
         """Save trend analysis results to CSV"""
         if not results:
             print("No results to save")
@@ -777,13 +1416,15 @@ class CoinExDailyData:
             change_pct = ((last_close - first_close) / first_close) * 100
             print(f"   Change:      {change_pct:+.2f}%")
     
-    def fetch_all_usdt_markets(self, days: int = 365, filename: str = "all_usdt_markets_daily.csv"):
+    def fetch_all_usdt_markets(self, days: int = 365, filename: str = "all_usdt_markets_daily.csv",
+                              min_data_points: int = 0):
         """
         Fetch data for ALL USDT markets on CoinEx
         
         Args:
             days: Number of days to fetch
             filename: Output CSV filename
+            min_data_points: Minimum data points required (0 = no filter, markets with fewer points excluded)
         """
         print(f"\n{'='*80}")
         print(f"Fetching ALL USDT Markets")
@@ -801,6 +1442,8 @@ class CoinExDailyData:
         
         print(f"Found {len(usdt_markets)} USDT markets")
         print(f"Fetching {days} days of data for each market")
+        if min_data_points > 0:
+            print(f"Filter: Only keeping markets with {min_data_points}+ data points")
         print(f"Output file: {filename}\n")
         
         proceed = input(f"This will fetch {len(usdt_markets)} markets. Continue? (y/n): ").strip().lower()
@@ -817,6 +1460,7 @@ class CoinExDailyData:
         total_records = 0
         successful = 0
         failed = 0
+        filtered_out = 0
         
         for i, market in enumerate(usdt_markets, 1):
             print(f"\n[{i}/{len(usdt_markets)}] Processing {market}...")
@@ -828,8 +1472,14 @@ class CoinExDailyData:
                     parsed_data = self.parse_kline_data(klines)
                     
                     if parsed_data:
-                        # Append to single file
-                        self.save_to_csv(parsed_data, filename, append=(i > 1))
+                        # Check minimum data points
+                        if min_data_points > 0 and len(parsed_data) < min_data_points:
+                            print(f"   ⚠️  Filtered: Only {len(parsed_data)} data points (need {min_data_points})")
+                            filtered_out += 1
+                            continue
+                        
+                        # Append to single file (only if we have successful markets already or this is first)
+                        self.save_to_csv(parsed_data, filename, append=(successful > 0))
                         total_records += len(parsed_data)
                         successful += 1
                         
@@ -853,13 +1503,15 @@ class CoinExDailyData:
             # Progress update every 50 markets
             if i % 50 == 0:
                 print(f"\n--- Progress: {i}/{len(usdt_markets)} markets processed ---")
-                print(f"    Successful: {successful} | Failed: {failed} | Total records: {total_records}\n")
+                print(f"    Successful: {successful} | Failed: {failed} | Filtered: {filtered_out} | Total records: {total_records}\n")
         
         print(f"\n{'='*80}")
         print(f"✓ Completed! All USDT markets data saved to: {filename}")
         print(f"   Total markets attempted: {len(usdt_markets)}")
         print(f"   Successful:              {successful}")
         print(f"   Failed:                  {failed}")
+        if min_data_points > 0:
+            print(f"   Filtered out:            {filtered_out} (< {min_data_points} data points)")
         print(f"   Total records:           {total_records}")
         print(f"{'='*80}")
     
@@ -1041,9 +1693,11 @@ def main():
     print("4. List markets by quote currency (e.g., USDT, BTC)")
     print("5. Fetch ALL USDT markets (automatic)")
     print("6. Analyze trends for ALL USDT markets (Mann-Kendall)")
+    print("7. Rolling window trend analysis (e.g., 30-day windows over 90 days)")
+    print("8. Rolling window analysis FROM CSV (faster - no fetching)")
     print()
     
-    choice = input("Enter choice (1-6): ").strip()
+    choice = input("Enter choice (1-8): ").strip()
     
     if choice == "1":
         market = input(f"Enter market (default: {SINGLE_MARKET}): ").strip().upper()
@@ -1110,10 +1764,13 @@ def main():
         days_input = input(f"Enter number of days (default: {DAYS}, max: 1000): ").strip()
         days = int(days_input) if days_input else DAYS
         
+        min_points_input = input(f"Minimum data points required (default: 0 = no filter): ").strip()
+        min_points = int(min_points_input) if min_points_input else 0
+        
         filename_input = input("Output filename (default: all_usdt_markets_daily.csv): ").strip()
         filename = filename_input if filename_input else "all_usdt_markets_daily.csv"
         
-        fetcher.fetch_all_usdt_markets(days, filename)
+        fetcher.fetch_all_usdt_markets(days, filename, min_points)
     
     elif choice == "6":
         # Trend analysis
@@ -1147,6 +1804,119 @@ def main():
                 if not filename:
                     filename = "trend_analysis_results.csv"
                 fetcher.save_trend_results(results, filename)
+    
+    elif choice == "7":
+        # Rolling window analysis
+        print("\n📊 ROLLING WINDOW TREND ANALYSIS")
+        print("   Analyze trends using a sliding window approach")
+        print("   Example: 30-day window sliding over 90 days = 61 trend measurements\n")
+        
+        print("Select test type:")
+        print("1. Hamed-Rao Modified (RECOMMENDED for crypto)")
+        print("2. Original Mann-Kendall")
+        test_choice = input("Test type (1 or 2, default: 1): ").strip()
+        use_modified = test_choice != "2"
+        
+        days_input = input("\nTotal days of historical data (default: 90): ").strip()
+        days = int(days_input) if days_input else 90
+        
+        window_input = input("Window size in days (default: 30): ").strip()
+        window_size = int(window_input) if window_input else 30
+        
+        if window_size >= days:
+            print(f"❌ Window size ({window_size}) must be smaller than total days ({days})")
+        else:
+            top_n_input = input("How many top results to display? (default: 20): ").strip()
+            top_n = int(top_n_input) if top_n_input else 20
+            
+            # Run rolling window analysis
+            results = fetcher.analyze_rolling_window_all_markets(
+                days=days, 
+                window_size=window_size, 
+                use_modified=use_modified
+            )
+            
+            if results:
+                # Display results
+                fetcher.display_rolling_results(results, top_n)
+                
+                # Offer to save summary
+                save = input("\nSave summary results to CSV? (y/n): ").strip().lower()
+                if save == 'y':
+                    filename = input("Filename (default: rolling_trend_analysis.csv): ").strip()
+                    if not filename:
+                        filename = "rolling_trend_analysis.csv"
+                    fetcher.save_rolling_results(results, filename)
+                
+                # Offer to save detailed window-by-window analysis
+                save_detailed = input("\nSave detailed window-by-window analysis? (y/n): ").strip().lower()
+                if save_detailed == 'y':
+                    filename = input("Filename (default: window_by_window_trends.csv): ").strip()
+                    if not filename:
+                        filename = "window_by_window_trends.csv"
+                    
+                    top_n_input = input("Top N markets per window (default: 10): ").strip()
+                    top_n_per_window = int(top_n_input) if top_n_input else 10
+                    
+                    fetcher.save_window_by_window_analysis(results, filename, top_n_per_window)
+    
+    elif choice == "8":
+        # Rolling window analysis from CSV
+        print("\n📊 ROLLING WINDOW ANALYSIS FROM CSV")
+        print("   Analyze pre-fetched data (much faster!)")
+        print("   Use CSV files from option 2 or option 5\n")
+        
+        csv_file = input("Enter CSV filename (e.g., all_markets_daily.csv): ").strip()
+        
+        if not csv_file:
+            print("❌ No filename provided")
+        else:
+            print("\nSelect test type:")
+            print("1. Hamed-Rao Modified (RECOMMENDED for crypto)")
+            print("2. Original Mann-Kendall")
+            test_choice = input("Test type (1 or 2, default: 1): ").strip()
+            use_modified = test_choice != "2"
+            
+            window_input = input("\nWindow size in days (default: 30): ").strip()
+            window_size = int(window_input) if window_input else 30
+            
+            min_points_input = input("Minimum data points per market (default: 0 = only check window size): ").strip()
+            min_points = int(min_points_input) if min_points_input else 0
+            
+            top_n_input = input("How many top results to display? (default: 20): ").strip()
+            top_n = int(top_n_input) if top_n_input else 20
+            
+            # Run rolling window analysis from CSV
+            results = fetcher.analyze_rolling_window_from_csv(
+                csv_file=csv_file,
+                window_size=window_size,
+                use_modified=use_modified,
+                min_data_points=min_points
+            )
+            
+            if results:
+                # Display results
+                fetcher.display_rolling_results(results, top_n)
+                
+                # Offer to save summary
+                save = input("\nSave summary results to CSV? (y/n): ").strip().lower()
+                if save == 'y':
+                    filename = input("Filename (default: rolling_trend_analysis.csv): ").strip()
+                    if not filename:
+                        filename = "rolling_trend_analysis.csv"
+                    fetcher.save_rolling_results(results, filename)
+                
+                # Offer to save detailed window-by-window analysis
+                save_detailed = input("\nSave detailed window-by-window analysis? (y/n): ").strip().lower()
+                if save_detailed == 'y':
+                    filename = input("Filename (default: window_by_window_trends.csv): ").strip()
+                    if not filename:
+                        filename = "window_by_window_trends.csv"
+                    
+                    top_n_input = input("Top N markets per window (default: 10): ").strip()
+                    top_n_per_window = int(top_n_input) if top_n_input else 10
+                    
+                    fetcher.save_window_by_window_analysis(results, filename, top_n_per_window)
         
     else:
         print("❌ Invalid choice")
